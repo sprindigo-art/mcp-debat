@@ -319,14 +319,6 @@ export async function advanceDebate(session, opts = {}) {
     return { session_id: session.id, error: 'Request already in progress. Wait for current model to finish.', status: 'concurrent_blocked' };
   }
 
-  // Bug 1 fix: return missed response from previous model (client timed out but model finished)
-  if (session._lastResult) {
-    const missed = session._lastResult;
-    session._lastResult = null;
-    SessionManager.save(session);
-    return { ...missed, recovered: true, message: (missed.message || '') + ' [RECOVERED — previous model finished after client timeout]' };
-  }
-
   session._processing = true;
 
   try {
@@ -733,10 +725,6 @@ export async function advanceDebate(session, opts = {}) {
         ? `Phase ${phase} complete.${collapseWarning ? ' ⚠️ COLLAPSE!' : ''}${driftWarning ? ' ⚠️ DRIFT!' : ''} HOST_WINDOW open.`
         : `${provider.name} responded. Next: ${modelOrder[session.currentModelIndex]}.`
     };
-
-    // Bug 1 fix: save result for recovery if client times out before receiving this
-    session._lastResult = advanceResult;
-    SessionManager.save(session);
 
     return advanceResult;
   } catch (err) {
