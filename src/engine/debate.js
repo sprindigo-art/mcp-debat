@@ -98,20 +98,28 @@ function anonymizeContent(text, modelId) {
   return result;
 }
 
+// Max total context chars to send to any provider — prevents 429/503 from oversized requests
+const MAX_CONTEXT_CHARS = 80000; // ~25K tokens — safe for all providers including Mistral (25K tokens/min)
+
 function buildConversationMessages(session, currentModelId, anonymize = false) {
   const messages = [];
   const isFull = session.history_mode === 'full';
   const maxPerResponse = isFull ? 0 : 1500;
+  let totalChars = 0;
 
-  messages.push({ role: 'user', content: `[HOST/Claude opens debate]:\n${getPhaseContext(session)}` });
+  const briefingText = getPhaseContext(session);
+  messages.push({ role: 'user', content: `[HOST/Claude opens debate]:\n${briefingText}` });
+  totalChars += briefingText.length;
 
   if (session.hostInterventions?.length > 0) {
     for (const h of session.hostInterventions.slice(-3)) {
-      messages.push({ role: 'user', content: `[HOST/${h.type}]: ${h.response}` });
+      const hText = `[HOST/${h.type}]: ${h.response}`;
+      messages.push({ role: 'user', content: hText });
+      totalChars += hText.length;
     }
   }
 
-  for (const phase of ['constructive', 'challenge', 'closing', 'challenge_qa', 'tool_observations']) {
+  for (const phase of ['tool_observations', 'constructive', 'challenge', 'closing', 'challenge_qa']) {
     const responses = session.phases[phase];
     if (!responses?.length) continue;
 
@@ -119,7 +127,19 @@ function buildConversationMessages(session, currentModelId, anonymize = false) {
       if (r.error) continue;
       let text = typeof r.content === 'string' ? r.content : JSON.stringify(r.content);
       if (maxPerResponse > 0) text = text.substring(0, maxPerResponse);
+
+      // Context budget: skip older entries if over limit
+      if (totalChars + text.length > MAX_CONTEXT_CHARS) {
+        if (phase === 'tool_observations') {
+          // Summarize long runbook chunks instead of dropping
+          text = text.substring(0, 500) + '\n[CHUNK TRIMMED — context budget reached]';
+        } else {
+          continue; // Skip this response to stay in budget
+        }
+      }
+
       if (anonymize) text = anonymizeContent(text, currentModelId);
+      totalChars += text.length;
 
       if (r.model === currentModelId) {
         messages.push({ role: 'assistant', content: text });
@@ -133,28 +153,42 @@ function buildConversationMessages(session, currentModelId, anonymize = false) {
   return messages;
 }
 
-// GAP 4: Auto-retry 1x with backoff + GAP 3: Reframe on refusal
-async function callWithRetry(provider, messages, retries = 1, chatOpts = {}) {
-  try {
-    const result = await provider.chat(messages, chatOpts);
-    if (result.refused && result.reframe && !provider.disabled) {
-      const reframed = provider.reframeMessages(messages);
-      try {
-        const retryResult = await provider.chat(reframed, chatOpts);
-        if (!retryResult.refused) {
-          provider.refusalCount = 0;
-          return retryResult;
-        }
-      } catch { /* reframe retry failed, return original */ }
+// Retry with exponential backoff for 429/503/rate limit errors
+const RETRYABLE_PATTERNS = [/429/i, /503/i, /rate.?limit/i, /too many/i, /overloaded/i, /high demand/i, /quota/i, /capacity/i];
+
+function isRetryableError(err) {
+  const msg = (err?.message || err?.toString() || '').toLowerCase();
+  return RETRYABLE_PATTERNS.some(p => p.test(msg));
+}
+
+async function callWithRetry(provider, messages, maxRetries = 3, chatOpts = {}) {
+  let lastErr = null;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await provider.chat(messages, chatOpts);
+      if (result.refused && result.reframe && !provider.disabled) {
+        const reframed = provider.reframeMessages(messages);
+        try {
+          const retryResult = await provider.chat(reframed, chatOpts);
+          if (!retryResult.refused) {
+            provider.refusalCount = 0;
+            return retryResult;
+          }
+        } catch { /* reframe retry failed, return original */ }
+      }
+      return result;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxRetries && isRetryableError(err)) {
+        const delay = Math.min(3000 * Math.pow(2, attempt), 15000);
+        console.error(`[debate] ${provider.id} attempt ${attempt + 1}/${maxRetries + 1} failed: ${err.message}. Retry in ${delay}ms`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      throw err;
     }
-    return result;
-  } catch (err) {
-    if (retries > 0) {
-      await new Promise(r => setTimeout(r, 2000));
-      return await provider.chat(messages);
-    }
-    throw err;
   }
+  throw lastErr;
 }
 
 // handleChallengeQuestions REMOVED — obsolete, replaced by pendingQuestions architecture (Bug 28 fix)
@@ -198,6 +232,23 @@ export async function runPhase(session, phase) {
 
     // Mandatory runbook ingestion if require_full_runbook
     if (session.require_full_runbook && session.target) {
+      // When require_full_runbook is ON, skip briefing runbook injection to avoid DOUBLE context
+      // Runbook will be in tool_observations instead (more structured, chunk-by-chunk)
+      if (runbookMeta.runbook_chars_injected > 525) {
+        // Replace large briefing runbook with pointer — full content comes via tool_observations
+        const briefingIdx = session.briefing?.indexOf('\nTARGET INTEL:\n');
+        if (briefingIdx > -1) {
+          const endIdx = session.briefing.indexOf('\nPREVIOUS CONCLUSIONS', briefingIdx);
+          const cutEnd = endIdx > -1 ? endIdx : session.briefing.indexOf('\n=== END BRIEFING ===', briefingIdx);
+          if (cutEnd > -1) {
+            session.briefing = session.briefing.substring(0, briefingIdx) +
+              '\nTARGET INTEL: [Full runbook loaded via TOOL_OBSERVATIONS — ' + runbookMeta.runbook_chars_original + ' chars, see chunks below]\n' +
+              session.briefing.substring(cutEnd);
+            runbookMeta.briefing_replaced = true;
+          }
+        }
+      }
+
       const { readRunbookChunk } = await import('./executor.js');
       let offset = 0;
       const limit = 50;
