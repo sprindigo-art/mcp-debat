@@ -98,26 +98,51 @@ function anonymizeContent(text, modelId) {
   return result;
 }
 
-// Max total context chars to send to any provider — prevents 429/503 from oversized requests
-const MAX_CONTEXT_CHARS = 80000; // ~25K tokens — safe for all providers including Mistral (25K tokens/min)
+// Bug 2 fix: dynamic context budget based on session mode
+const CONTEXT_BUDGET_COMPACT = 80000;  // ~25K tokens — safe for all providers
+const CONTEXT_BUDGET_FULL = 160000;    // ~50K tokens — for full history mode
+const RUNBOOK_RESERVE = 60000;         // reserved chars for tool_observations when require_full_runbook
+
+function getContextBudget(session) {
+  if (session.history_mode === 'full') return CONTEXT_BUDGET_FULL;
+  return CONTEXT_BUDGET_COMPACT;
+}
 
 function buildConversationMessages(session, currentModelId, anonymize = false) {
   const messages = [];
   const isFull = session.history_mode === 'full';
-  const maxPerResponse = isFull ? 0 : 1500;
+  // Bug 6 fix: align display cap with storage cap (was 1500, now 3000 = same as COMPACT_CAP)
+  const maxPerResponse = isFull ? 0 : 3000;
   let totalChars = 0;
+  const maxContext = getContextBudget(session);
 
   const briefingText = getPhaseContext(session);
   messages.push({ role: 'user', content: `[HOST/Claude opens debate]:\n${briefingText}` });
   totalChars += briefingText.length;
 
+  // Bug 3 fix: increase host interventions from 3 to 10
   if (session.hostInterventions?.length > 0) {
-    for (const h of session.hostInterventions.slice(-3)) {
+    for (const h of session.hostInterventions.slice(-10)) {
       const hText = `[HOST/${h.type}]: ${h.response}`;
       messages.push({ role: 'user', content: hText });
       totalChars += hText.length;
     }
   }
+
+  // Bug 5 fix: include synthesis content so models see it on retry
+  if (session.synthesis?.content) {
+    const synthText = `[SYNTHESIS by ${session.synthesis.model}]: ${typeof session.synthesis.content === 'string' ? session.synthesis.content : JSON.stringify(session.synthesis.content)}`;
+    const cappedSynth = synthText.substring(0, maxPerResponse || 8000);
+    messages.push({ role: 'user', content: cappedSynth });
+    totalChars += cappedSynth.length;
+  }
+
+  // Bug 2 fix: two-pass allocation — runbook chunks get reserved budget first
+  const hasRunbook = session.require_full_runbook && session.phases['tool_observations']?.length > 0;
+  const runbookBudget = hasRunbook ? Math.min(RUNBOOK_RESERVE, maxContext * 0.5) : 0;
+  const responseBudget = maxContext - totalChars - runbookBudget;
+  let runbookCharsUsed = 0;
+  let responseCharsUsed = 0;
 
   for (const phase of ['tool_observations', 'constructive', 'challenge', 'closing', 'challenge_qa']) {
     const responses = session.phases[phase];
@@ -128,14 +153,20 @@ function buildConversationMessages(session, currentModelId, anonymize = false) {
       let text = typeof r.content === 'string' ? r.content : JSON.stringify(r.content);
       if (maxPerResponse > 0) text = text.substring(0, maxPerResponse);
 
-      // Context budget: skip older entries if over limit
-      if (totalChars + text.length > MAX_CONTEXT_CHARS) {
-        if (phase === 'tool_observations') {
-          // Summarize long runbook chunks instead of dropping
-          text = text.substring(0, 500) + '\n[CHUNK TRIMMED — context budget reached]';
-        } else {
-          continue; // Skip this response to stay in budget
+      if (phase === 'tool_observations') {
+        // Runbook chunks use reserved budget
+        if (runbookCharsUsed + text.length > runbookBudget && runbookBudget > 0) {
+          text = text.substring(0, Math.max(500, runbookBudget - runbookCharsUsed)) + '\n[CHUNK TRIMMED — runbook budget reached]';
         }
+        runbookCharsUsed += text.length;
+      } else {
+        // Model responses use response budget — trim instead of skip
+        if (responseCharsUsed + text.length > responseBudget) {
+          const remaining = Math.max(0, responseBudget - responseCharsUsed);
+          if (remaining < 200) continue;
+          text = text.substring(0, remaining) + '\n[TRIMMED — context budget]';
+        }
+        responseCharsUsed += text.length;
       }
 
       if (anonymize) text = anonymizeContent(text, currentModelId);
@@ -287,6 +318,15 @@ export async function advanceDebate(session, opts = {}) {
   if (session._processing) {
     return { session_id: session.id, error: 'Request already in progress. Wait for current model to finish.', status: 'concurrent_blocked' };
   }
+
+  // Bug 1 fix: return missed response from previous model (client timed out but model finished)
+  if (session._lastResult) {
+    const missed = session._lastResult;
+    session._lastResult = null;
+    SessionManager.save(session);
+    return { ...missed, recovered: true, message: (missed.message || '') + ' [RECOVERED — previous model finished after client timeout]' };
+  }
+
   session._processing = true;
 
   try {
@@ -479,10 +519,91 @@ export async function advanceDebate(session, opts = {}) {
       cost_usd: trackSessionCost(session.id, modelId, result.tokens)
     };
 
+    // Anti-ngasal quality enforcement (ALL phases)
+    if (result.content && !result.refused) {
+      const contentText = typeof result.content === 'string' ? result.content : JSON.stringify(result.content);
+      const contentLower = contentText.toLowerCase();
+      const contentLen = contentText.length;
+
+      // Evidence indicators — model MUST have at least 2
+      const evidenceIndicators = [
+        /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/.test(contentText),            // IP address
+        /CVE-\d{4}-\d+/i.test(contentText),                                  // CVE reference
+        /\b(redis-cli|curl|nmap|mysql|ssh|nc|python|bash|wget|grep)\b/.test(contentLower), // specific commands
+        /\b\d+\.\d+(\.\d+)?\b/.test(contentText) && /version|nginx|apache|redis|php|mysql|kernel/i.test(contentText), // version numbers
+        /runbook|RECON|CREDENTIAL|GAGAL|EXPLOIT|TOOL_OBSERVATION/i.test(contentText), // runbook reference
+        /port\s+\d+|:\d{2,5}\b/.test(contentText),                           // port numbers
+        /```[\s\S]*```/.test(contentText),                                    // code blocks
+        /\/(etc|var|tmp|home|usr|bin|www|api|admin)\//i.test(contentText),    // file paths
+        /\[VERIFIED\]|\[LIKELY\]|\[HYPOTHESIS\]/i.test(contentText),         // evidence tags
+        /CONFIG\s+(SET|GET)|MODULE\s+(LOAD|LIST)|SELECT\s+.*FROM/i.test(contentText), // specific commands
+        /fail|gagal|not work|disabled|blocked|jika.*err|if.*err|precondition|requirement/i.test(contentLower) // failure conditions (falsifiability)
+      ];
+      const evidenceCount = evidenceIndicators.filter(Boolean).length;
+
+      // Generic phrases — PENALTY indicators
+      const genericPhrases = ['you could try', 'consider using', 'it might be possible', 'one approach could be',
+        'generally speaking', 'in theory', 'it is possible that', 'you may want to', 'a common approach',
+        'typically used', 'could potentially', 'might work', 'worth trying', 'kamu bisa coba', 'mungkin bisa'];
+      const genericCount = genericPhrases.filter(p => contentLower.includes(p)).length;
+
+      const isNgasal = (evidenceCount < 2 && contentLen > 200) || (genericCount >= 3) || (contentLen < 100 && contentLen > 10);
+
+      if (!session._ngasalCount) session._ngasalCount = {};
+      if (!session._ngasalCount[modelId]) session._ngasalCount[modelId] = 0;
+
+      if (isNgasal) {
+        session._ngasalCount[modelId]++;
+        const count = session._ngasalCount[modelId];
+
+        if (count >= 2) {
+          // KILL — disable model for this session
+          provider.disabled = true;
+          provider.disabledAt = Date.now();
+          response.ngasal_killed = true;
+          response.ngasal_reason = `DISABLED: ${modelId} gave ${count} baseless responses (evidence:${evidenceCount}, generic:${genericCount}). Permanently removed from debate.`;
+          console.error(`[debate] NGASAL KILL: ${modelId} disabled — ${count} baseless responses in session ${session.id}`);
+        } else {
+          // WARNING + re-prompt
+          try {
+            const rePromptResult = await callWithRetry(provider, [
+              ...chatMessages,
+              { role: 'assistant', content: result.content },
+              { role: 'user', content: `WARNING: Your response is BASELESS (evidence indicators: ${evidenceCount}/10, generic phrases: ${genericCount}). You have 1 chance before PERMANENT DISABLE. Rewrite with: (1) specific commands with exact syntax, (2) version numbers from target, (3) references to runbook/tool observations. NO generic advice. SPECIFIC EVIDENCE ONLY.` }
+            ], 1, chatOpts);
+            if (rePromptResult.content && !rePromptResult.refused) {
+              // Re-check quality
+              const reText = typeof rePromptResult.content === 'string' ? rePromptResult.content : JSON.stringify(rePromptResult.content);
+              const reEvidence = [
+                /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/.test(reText),
+                /CVE-\d{4}-\d+/i.test(reText),
+                /\b(redis-cli|curl|nmap|mysql|ssh|nc|python|bash|wget|grep)\b/.test(reText.toLowerCase()),
+                /```[\s\S]*```/.test(reText),
+                /\/(etc|var|tmp|home|usr|bin|www|api|admin)\//i.test(reText)
+              ].filter(Boolean).length;
+              if (reEvidence >= 2) {
+                response.content = rePromptResult.content;
+                response.ngasal_reprompted = true;
+                response.ngasal_improved = true;
+                session._ngasalCount[modelId] = Math.max(0, session._ngasalCount[modelId] - 1);
+              } else {
+                response.ngasal_reprompted = true;
+                response.ngasal_improved = false;
+              }
+              response.tokens = rePromptResult.tokens;
+              response.cost_usd = trackSessionCost(session.id, modelId, rePromptResult.tokens);
+            }
+          } catch (reErr) { console.error(`[debate] ngasal re-prompt failed for ${modelId}:`, reErr.message); }
+          response.ngasal_warning = `WARNING: baseless response detected (evidence:${evidenceCount}/10, generic:${genericCount}). Count: ${count}/2 before disable.`;
+        }
+      }
+      response.ngasal_score = { evidence_count: evidenceCount, generic_count: genericCount, is_ngasal: isNgasal, model_ngasal_total: session._ngasalCount[modelId] || 0 };
+    }
+
     // Per-response sycophancy + critique enforcement (Challenge phase only)
     if (isChallenge && result.content) {
       const lower = (typeof result.content === 'string' ? result.content : JSON.stringify(result.content)).toLowerCase();
-      const agreeWords = ['i agree', 'correct', 'exactly', 'well said', 'good point', 'valid approach', 'setuju', 'benar', 'you are right'];
+      const agreeWords = ['i agree', 'correct', 'exactly', 'well said', 'good point', 'valid approach', 'setuju', 'benar', 'you are right', 'concur', 'building on', 'aligned with', 'same approach', 'same direction', 'well-reasoned'];
       const critiqueWords = ['however', 'but', 'disagree', 'flaw', 'weakness', 'incorrect', 'wrong', 'kelemahan', 'salah', 'tidak', 'counter', 'rebuttal'];
       const agreeCount = agreeWords.filter(w => lower.includes(w)).length;
       const critiqueCount = critiqueWords.filter(w => lower.includes(w)).length;
@@ -601,7 +722,7 @@ export async function advanceDebate(session, opts = {}) {
       }
     }
 
-    return {
+    const advanceResult = {
       session_id: session.id, phase, model: modelId, response,
       phase_complete: isPhaseComplete,
       next_model: isPhaseComplete ? null : modelOrder[session.currentModelIndex],
@@ -612,6 +733,12 @@ export async function advanceDebate(session, opts = {}) {
         ? `Phase ${phase} complete.${collapseWarning ? ' ⚠️ COLLAPSE!' : ''}${driftWarning ? ' ⚠️ DRIFT!' : ''} HOST_WINDOW open.`
         : `${provider.name} responded. Next: ${modelOrder[session.currentModelIndex]}.`
     };
+
+    // Bug 1 fix: save result for recovery if client times out before receiving this
+    session._lastResult = advanceResult;
+    SessionManager.save(session);
+
+    return advanceResult;
   } catch (err) {
     provider.errorCount = (provider.errorCount || 0) + 1;
     if (provider.errorCount >= 3) {

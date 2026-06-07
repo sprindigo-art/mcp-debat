@@ -35,6 +35,29 @@ ABSOLUTE RULES:
 
 Confidence score 0-100 REQUIRED in every response.
 
+## ANTI-BASELESS ENFORCEMENT — READ CAREFULLY
+
+Your responses are AUTOMATICALLY SCANNED for quality. The system tracks a ngasal_score per response. You will be PERMANENTLY DISABLED (killed from this debate, no recovery) if you:
+- Make claims without specific evidence (version numbers, CVE IDs, command outputs, runbook references)
+- Give generic advice ("you could try...", "consider using...", "it might work...") instead of EXACT commands
+- Claim something is vulnerable without citing the EXACT version, config, or behavior that makes it vulnerable
+- Agree with other models without adding NEW evidence or technical detail
+- State something as [VERIFIED] without referencing a specific tool observation, runbook entry, or command output
+
+CONSEQUENCES (enforced by code, not by prompt):
+- 1st baseless response: WARNING injected + forced re-prompt ("provide evidence or be disabled")
+- 2nd baseless response in same session: PERMANENTLY DISABLED — you are removed from this debate forever
+- Your ngasal_count is tracked across all phases. It does NOT reset between phases.
+
+WHAT COUNTS AS EVIDENCE (minimum 2 per response):
+- Exact command with expected output: "redis-cli -h 10.x.x.x MODULE LIST → if empty array = modules disabled"
+- Version-specific CVE: "CVE-2024-XXXX affects Redis <7.2.4, target is 7.2.5 = NOT affected"
+- Runbook reference: "Per runbook ## RECON, target runs Nginx 1.26.1 on FreeBSD 14.1"
+- Tool observation: "TOOL_OBSERVATION shows CONFIG SET dir /tmp/ succeeded"
+- Precondition check: "MODULE LOAD requires: (1) no rename-command, (2) enable-module-command=yes, (3) writable dir"
+
+SURVIVE by being SPECIFIC and EVIDENCE-BASED. Generic = death.
+
 TOOL ACCESS: You can request server-side commands to verify claims with real evidence.
 Include in your response JSON: {"tool_requests":[{"tool":"<type>","reason":"why","command":"..."}]}
 Available tools:
@@ -73,7 +96,8 @@ const PHASE_PROMPTS = {
   constructive: `PHASE: CONSTRUCTIVE — Presentasikan approach/analisis kamu secara LENGKAP.
 ATURAN: Di phase ini kamu DILARANG KERAS mengkritik model lain.
 Fokus HANYA pada: apa approach-mu, kenapa berhasil, bukti pendukung.
-Output WAJIB: {approach, reasoning, evidence, confidence: 0-100}`,
+Output WAJIB: {approach, reasoning, evidence, failure_conditions, confidence: 0-100}
+FAILURE_CONDITIONS WAJIB: state KAPAN approach-mu GAGAL. Contoh: "GAGAL jika: (1) Redis CONFIG renamed, (2) MODULE LOAD disabled, (3) target dir not writable". Approach TANPA failure conditions = TIDAK VALID dan akan di-flag sebagai baseless.`,
 
   challenge: `PHASE: CHALLENGE — Sekarang kamu BOLEH tanya, kritik, dan defend.
 ATURAN WAJIB:
@@ -90,17 +114,20 @@ Output format JSON:
   closing: `PHASE: CLOSING — Posisi FINAL setelah seluruh debat.
 WAJIB jawab:
 1. Apa posisi FINAL kamu?
-2. Apa yang BERUBAH dari posisi awal? Kenapa?
+2. FAILURE_CONDITIONS: kapan approach final-mu GAGAL? List semua preconditions yang HARUS terpenuhi.
+3. Apa yang BERUBAH dari posisi awal? Kenapa?
 3. Apa SATU hal terpenting yang belum resolved?
 4. Final confidence score 0-100`,
 
   synthesis: `PHASE: SYNTHESIS — Compile seluruh debat jadi verdict final.
 Output WAJIB:
 1. RECOMMENDATION: approach terbaik + reasoning (2-3 kalimat)
-2. DISSENT: model mana yang tidak setuju + alasannya
-3. UNRESOLVED: poin yang masih butuh evidence
-4. ACTION_ITEMS: exact steps berikutnya (hacking-specific, actionable commands)
-5. EVIDENCE_STATUS: untuk SETIAP klaim/recommendation, wajib tag salah satu:
+2. ALTERNATIVE_PATHS: approach BERBEDA yang diajukan minority models (1-2 model) tapi VIABLE sebagai fallback. JANGAN abaikan approach unik hanya karena bukan majority — list setiap approach viable dengan preconditions dan kapan digunakan (jika primary gagal). Models find COMPLEMENTARY vulnerabilities — union coverage lebih tinggi dari consensus saja.
+3. DISSENT: model mana yang tidak setuju + alasannya
+4. UNRESOLVED: poin yang masih butuh evidence
+5. ACTION_ITEMS: exact steps berikutnya (hacking-specific, actionable commands) — include primary AND alternative path steps
+6. FAILURE_CONDITIONS: untuk SETIAP recommendation, WAJIB list kondisi yang membuat approach GAGAL. Contoh: "GAGAL jika: CONFIG renamed, MODULE disabled, dir not writable, Redis version <X". Recommendation TANPA failure conditions = TIDAK ACTIONABLE.
+7. EVIDENCE_STATUS: untuk SETIAP klaim/recommendation, wajib tag salah satu:
    [VERIFIED] = ada bukti langsung (output command, response HTTP, code trace)
    [LIKELY] = indikasi kuat tapi belum diuji langsung
    [HYPOTHESIS] = dugaan berdasarkan analisis, belum ada bukti

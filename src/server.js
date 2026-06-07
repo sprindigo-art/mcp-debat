@@ -1,9 +1,11 @@
 import { createServer } from 'http';
 import { getToolDefinitions, executeTool, hasTool } from './tools/index.js';
+import { SessionManager } from './engine/sessions.js';
 import config from '../config.json' with { type: 'json' };
 
 const PORT = process.env.PORT || config.server.port || 3900;
 const AUTH_TOKEN = process.env[config.server.authTokenEnv] || '';
+let _lastToolSessionId = null;
 const PROTOCOL_VERSION = '2024-11-05';
 
 function jsonRpcResponse(id, result) {
@@ -44,6 +46,8 @@ async function handleJsonRpc(body) {
       }
       try {
         const result = await executeTool(name, args || {});
+        // Bug 1 fix: save session_id for _lastResult cleanup (stored in module-level var, not on response)
+        if (typeof result === 'object' && result.session_id) _lastToolSessionId = result.session_id;
         return jsonRpcResponse(id, {
           content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result) }]
         });
@@ -120,6 +124,9 @@ export function startServer() {
     }
 
     try {
+      let clientDisconnected = false;
+      req.on('close', () => { if (!res.writableFinished) clientDisconnected = true; });
+
       const body = await parseBody(req);
       const result = await handleJsonRpc(body);
 
@@ -131,6 +138,14 @@ export function startServer() {
 
       res.writeHead(200);
       res.end(JSON.stringify(result));
+
+      // Bug 1 fix: clear _lastResult after response successfully sent (client got it)
+      // If client disconnected, _lastResult stays for recovery on next call
+      if (!clientDisconnected && _lastToolSessionId) {
+        const session = SessionManager.get(_lastToolSessionId);
+        if (session) { session._lastResult = null; }
+        _lastToolSessionId = null;
+      }
     } catch (err) {
       res.writeHead(400);
       res.end(JSON.stringify(jsonRpcError(null, -32700, err.message)));

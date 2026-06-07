@@ -54,9 +54,14 @@ export function getAllProviders() {
 }
 
 export async function testProvider(provider) {
+  // Gemini 2.5 Flash thinking mode uses ~16-30 tokens for thinking before output
+  // maxTokens must be high enough to leave room for actual output after thinking
+  // Gemini thinking uses ~16-30 tokens, OpenAI reasoning uses ~50+ tokens before output
+  const thinkingModels = ['gemini', 'openai'];
+  const maxTokens = thinkingModels.includes(provider.id) ? 128 : 20;
   const result = await provider.chat([
     { role: 'user', content: 'Reply with exactly: OK' }
-  ], { maxTokens: 20, timeout: 15000 });
+  ], { maxTokens, timeout: 15000 });
   if (!result.content) throw new Error('Empty response');
   return true;
 }

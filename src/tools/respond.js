@@ -94,6 +94,8 @@ export default {
         session.currentPhase = 'challenge';
         session.currentModelIndex = 0;
         session.roundNumber++;
+        // Bug 4 fix: reverse model order for challenge (retry was bypassing normal phase transition)
+        session.modelOrder = [...(session.originalModelOrder || session.modelOrder)].reverse();
         SessionManager.save(session);
         return advanceDebate(session);
 

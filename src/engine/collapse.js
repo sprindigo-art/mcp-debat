@@ -68,7 +68,7 @@ const ROLE_PROFILES = {
 
 const CHALLENGE_WORDS = ['disagree', 'wrong', 'flaw', 'weakness', 'but', 'however', 'incorrect', 'salah', 'kelemahan', 'tidak'];
 const QUESTION_WORDS = ['?', 'how', 'why', 'what if', 'have you', 'bagaimana', 'kenapa', 'apakah'];
-const SUPPORT_WORDS = ['agree', 'correct', 'exactly', 'good point', 'valid', 'setuju', 'benar', 'support'];
+const SUPPORT_WORDS = ['agree', 'correct', 'exactly', 'good point', 'valid', 'setuju', 'benar', 'support', 'concur', 'i think you are right', 'building on', 'aligned with', 'same approach', 'same direction', 'approach is valid', 'well-reasoned'];
 
 function classifySpeechActs(text) {
   const lower = text.toLowerCase();

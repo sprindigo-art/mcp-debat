@@ -31,6 +31,7 @@ export const SessionManager = {
       topic,
       target: target || null,
       context: context || null,
+      originalModelOrder: [...modelOrder],
       style,
       maxRounds: Math.min(rounds || 3, 20),
       roundNumber: 1,
