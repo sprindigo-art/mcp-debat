@@ -174,7 +174,7 @@ async function callWithRetry(provider, messages, maxRetries = 3, chatOpts = {}) 
             provider.refusalCount = 0;
             return retryResult;
           }
-        } catch { /* reframe retry failed, return original */ }
+        } catch (reframeErr) { console.error(`[debate] reframe retry failed for ${provider.id}:`, reframeErr.message); }
       }
       return result;
     } catch (err) {
@@ -505,7 +505,7 @@ export async function advanceDebate(session, opts = {}) {
             response.tokens = antiSycResult.tokens;
             response.cost_usd = trackSessionCost(session.id, modelId, antiSycResult.tokens);
           }
-        } catch { /* retry failed */ }
+        } catch (sycErr) { console.error(`[debate] anti-sycophancy re-prompt failed for ${modelId}:`, sycErr.message); }
       }
       response.sycophancy_score = { agree: agreeCount, critique: critiqueCount, ratio: critiqueCount > 0 ? agreeCount / critiqueCount : agreeCount > 0 ? 999 : 0 };
       response.critique_check = { has_weakness: hasWeakness, has_counterargument: hasCounterargument, has_steel_man: hasSteelMan, critique_required_passed: critiqueRequired };
@@ -529,7 +529,8 @@ export async function advanceDebate(session, opts = {}) {
             response.pending_qa = session.pendingQuestions.length;
           }
         }
-      } catch {
+      } catch (jsonErr) {
+        console.error(`[debate] Challenge JSON parse failed for ${modelId}:`, jsonErr.message?.substring(0, 100));
         try {
           const retryResult = await callWithRetry(provider, [
             ...chatMessages,
@@ -550,7 +551,7 @@ export async function advanceDebate(session, opts = {}) {
               response.json_retry = 'success';
             }
           }
-        } catch { response.json_retry = 'failed'; }
+        } catch (retryErr) { console.error(`[debate] Challenge JSON re-prompt also failed for ${modelId}:`, retryErr.message?.substring(0, 100)); response.json_retry = 'failed'; }
       }
     }
 
@@ -665,12 +666,26 @@ async function runSynthesis(session) {
   const phasePrompt = getPhasePrompt('synthesis');
   const history = buildConversationMessages(session, synthesizerId, false);
 
+  // Position count: summarize Closing positions for synthesizer context
+  let positionSummary = '';
+  const closingResponses = (session.phases['closing'] || []).filter(r => !r.error && r.content);
+  if (closingResponses.length >= 2) {
+    const positions = closingResponses.map(r => {
+      const text = (typeof r.content === 'string' ? r.content : JSON.stringify(r.content)).substring(0, 300);
+      const confMatch = text.match(/confidence[:\s]*(\d+)/i);
+      return { model: r.model, conf: confMatch ? parseInt(confMatch[1]) : null, snippet: text.substring(0, 150) };
+    });
+    positionSummary = `\n\nPOSITION COUNT (${positions.length} models in Closing):\n` +
+      positions.map(p => `- ${p.model} (conf ${p.conf || '?'}): ${p.snippet}...`).join('\n') +
+      `\n\nUse these positions to identify CONSENSUS vs DISSENT. Do NOT let majority override a well-evidenced minority position.`;
+  }
+
   const start = Date.now();
   try {
     const result = await callWithRetry(provider, [
       { role: 'system', content: systemPrompt },
       ...history,
-      { role: 'user', content: phasePrompt }
+      { role: 'user', content: phasePrompt + positionSummary }
     ]);
 
     let synthContent = result.content;
@@ -688,7 +703,7 @@ async function runSynthesis(session) {
         if (retryResult.content && evidenceTags.some(t => retryResult.content.includes(t))) {
           synthContent = retryResult.content;
         }
-      } catch { /* re-prompt failed, keep original */ }
+      } catch (tagErr) { console.error(`[debate] evidence tag re-prompt failed for ${synthesizerId}:`, tagErr.message); }
     }
 
     const taggedContent = synthContent;
