@@ -13,8 +13,8 @@
     },
     "gemini": {
       "enabled": true,
-      "name": "Gemini 2.5 Flash",
-      "model": "gemini-2.5-flash",
+      "name": "Gemini 3.5 Flash",
+      "model": "gemini-3.5-flash",
       "apiKeyEnv": "GEMINI_API_KEY",
       "sdk": "google",
       "timeout": 120000,
