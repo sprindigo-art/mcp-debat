@@ -1,0 +1,20 @@
+{
+  "name": "mcp-debat",
+  "version": "1.0.0",
+  "description": "Multi-model AI debate MCP server for offensive security workflow",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "openai": "^4.77.0",
+    "@google/generative-ai": "^0.24.0",
+    "@anthropic-ai/sdk": "^0.39.0",
+    "uuid": "^11.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
