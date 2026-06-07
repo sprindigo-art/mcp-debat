@@ -2159,3 +2159,95 @@ Setiap model dapat SATU kesempatan bicara per giliran:
 3. GPT-5.5 Pro timeout 55s → FIX: naikkan ke 90s di openai.js
 4. GPT-5.5 Pro diganti ke GPT-5.3 Codex oleh Tuan
 5. Gemini refuse di debate mode tanpa prefill → FIX: prefill OSCP 2-turn selalu unshift ke awal history
+
+---
+
+## UPDATE LOG (2026-06-07 — 2026-06-08)
+
+### Status: 12/12 FEATURES VERIFIED + DEPLOYED + DOCUMENTED
+
+### Bug Fixes (Post-Initial Deploy)
+| # | Bug | Root Cause | Fix |
+|---|-----|-----------|-----|
+| 1 | maxTokens not propagated | providers used `opts.maxTokens\|\|1024`, config ignored | `opts.maxTokens\|\|this.maxTokens\|\|1024` |
+| 2 | DOWN check skip Challenge | confidence unreliable (r=0.024) | DISABLED — Challenge always runs |
+| 3 | Challenge JSON silent fail | catch without re-prompt | re-prompt 1x with strict JSON hint |
+| 4 | MCP client timeout 60s | Claude Code built-in, not configurable | maxTokens 4096→2048 per provider |
+| 5 | Sycophancy not enforced | collapse.js per-phase only, not per-response | Added critique_check per response in Challenge |
+| 6 | OpenAI health maxTokens:10 | testProvider() below Responses API minimum 16 | maxTokens:10→20 |
+| 7 | OpenAI quota exhausted | Primary API key ran out | Auto-fallback to AWS Bedrock Mantle |
+
+### New Features (Post-Initial Deploy)
+
+**1. Command Executor (`src/engine/executor.js`)**
+- AI models can run read-only commands on server via `tool_requests`
+- Tools: bash (20 whitelisted commands), read_runbook_chunk/section/search
+- Security: 3-layer (path whitelist → command blacklist → command whitelist)
+- Target-locked: AI can only read current session's target runbook
+- Limits: 3 commands/response, 50/session, 30s timeout, 10K chars output
+- Config: `executor_mode: "safe"|"off"` parameter in mcp_debate
+
+**2. Mandatory Runbook Ingestion**
+- `require_full_runbook: true` → server auto-reads entire runbook to EOF before Constructive
+- Batch: 50 lines per chunk, stored as TOOL_OBSERVATION in transcript
+- Verified: 5 chunks, 224 lines, eof=true, zero gaps
+
+**3. Anti-Sycophancy Enforcement (critique_check)**
+- Per-response check in Challenge phase: has_weakness + has_counterargument + has_steel_man
+- If missing → auto re-prompt with anti-sycophancy warning
+- Returns: `critique_check` + `sycophancy_score {agree, critique, ratio}`
+- Verified: 3/4 models passed, 1 (Anthropic) correctly re-prompted
+
+**4. Evidence Gate Reference Validation (evidence_audit)**
+- Post-synthesis: [VERIFIED] claims must reference TOOL_OBSERVATION/runbook/source
+- Returns: `evidence_audit: {total_verified_claims, with_reference, without_reference}`
+- Verified: 2 claims flagged without reference
+
+**5. Anti Silent Truncation**
+- `history_mode: "compact"` = 3000 chars/response (COMPACT_CAP)
+- `history_mode: "full"` = 32000 chars/response (FULL_CAP)
+- Explicit `response_too_large` flag + `chars_over` count when truncated
+
+**6. Multi-User Session Lock**
+- Sessions have `owner_client` field
+- List filtered per client_id, get returns summary-only for non-owners
+- Delete/respond blocked for non-owners, transfer mechanism available
+- clear_memory requires `confirm:true` + `client_id` for audit trail
+
+**7. OpenAI Fallback to AWS Bedrock Mantle**
+- When primary OpenAI API returns HTTP 429/402/403/503 → auto-switch to fallback
+- Fallback: `bedrock-mantle.us-east-2.api.aws` with model `openai.gpt-5.5`
+- Recovery: primary check every 5 minutes, auto-switch back when available
+- Config: `providers.openai.fallback` section with separate baseURL/model/apiKeyEnv
+- Env: `OPENAI_FALLBACK_KEY` for Bedrock Mantle bearer token
+- PM2 NOTE: `pm2 restart` does NOT reload new env vars. Use `pm2 delete + pm2 start ecosystem.config.cjs`
+
+### Per-Provider maxTokens (Current)
+| Provider | maxTokens | Estimated Latency |
+|----------|-----------|-------------------|
+| Gemini 2.5 Flash | 8192 | ~17-30s |
+| DeepSeek V4 Pro | 2048 | ~35-55s |
+| Mistral Medium 3.5 | 2048 | ~8-36s |
+| Qwen3 Coder 480B | 2048 | ~6-31s |
+| OpenAI GPT-5.3/5.5 | 2048 | ~10-35s |
+| Anthropic Opus 4.6 | 1536 | ~33-56s |
+
+### Documentation + GitHub
+- README.md: 514 lines, 30 sections, full install/usage guide
+- .env.example: template for all 7 env vars
+- GitHub: https://github.com/sprindigo-art/mcp-debat (branch: main)
+- Rules: /home/kali/.claude/rules/mcp-debate-workflow.md (257 lines, updated)
+
+### 12/12 Verified Features
+1. Timeout hard cap → VERIFIED
+2. Janda AI first → VERIFIED
+3. Runbook sync target-locked → VERIFIED
+4. Full runbook EOF ingestion → VERIFIED
+5. Full history 32K cap → VERIFIED WITH LIMITS
+6. Sequential model-by-model → VERIFIED
+7. Session persistence → VERIFIED
+8. Host intervention → VERIFIED
+9. Anti-sycophancy critique_check → VERIFIED
+10. Evidence gate reference audit → VERIFIED
+11. Multi-user session lock → VERIFIED
+12. Command executor → VERIFIED
